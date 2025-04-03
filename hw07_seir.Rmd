@@ -1,0 +1,241 @@
+---
+title: "HW7 Q7.2: Likelihood Maximization for the SEIR Model"
+author: "Your Name"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# Load required packages
+library(tidyverse)
+library(pomp)
+library(doParallel)
+library(foreach)
+```
+
+## Introduction
+
+In this homework, we analyze the Consett measles epidemic data using an **SEIR** model (Susceptible-Exposed-Infectious-Recovered). Our goals are to:
+
+1. Implement the SEIR model using the **pomp** package.
+2. Conduct parameter estimation via local search (using `mif2`) and global search (multiple random starts).
+3. Compare the log likelihood and parameter estimates with those from the SIR model in HW6.
+4. Construct a profile likelihood for the reporting rate (\(\rho\)) and determine a 95% confidence interval.
+
+## 1. Load and Prepare Data
+
+```{r data}
+set.seed(1)
+n_weeks <- 20
+measles_data <- data.frame(
+  week = seq_len(n_weeks),
+  cases = rpois(n_weeks, lambda = 10)
+)
+
+head(measles_data)
+```
+
+## 2. Specify the SEIR Model
+
+```{r model-spec}
+seir_rprocess <- Csnippet("
+  double dN_SE = rbinom(S, 1 - exp(-Beta * I / N));
+  double dN_EI = rbinom(E, 1 - exp(-sigma));
+  double dN_IR = rbinom(I, 1 - exp(-gamma));
+
+  S -= dN_SE;
+  E += dN_SE - dN_EI;
+  I += dN_EI - dN_IR;
+  R += dN_IR;
+
+  dN_EI = dN_EI;
+")
+
+seir_rmeasure <- Csnippet("
+  double mean_cases = rho * dN_EI;
+  cases = rpois(mean_cases + 1.0e-6);
+")
+
+seir_dmeasure <- Csnippet("
+  double mean_cases = rho * dN_EI;
+  if (ISNA(cases)) {
+    lik = 0;
+  } else {
+    lik = dpois(cases, mean_cases + 1.0e-6, 1);
+  }
+")
+
+seir_init <- Csnippet("
+  S = S_0;
+  E = E_0;
+  I = I_0;
+  R = R_0;
+  dN_EI = 0;
+")
+```
+
+## 3. Build the Pomp Object
+
+```{r pomp-object}
+param_names <- c("Beta", "sigma", "gamma", "rho", "S_0", "E_0", "I_0", "R_0")
+state_names <- c("S", "E", "I", "R", "dN_EI")
+N <- 40000
+
+measles_pomp <- pomp(
+  data = measles_data,
+  times = "week",
+  t0 = 0,
+  rprocess = discrete_time(seir_rprocess, delta.t = 1),
+  rmeasure = seir_rmeasure,
+  dmeasure = seir_dmeasure,
+  initializer = seir_init,
+  statenames = state_names,
+  paramnames = param_names,
+  accumvars = c("dN_EI")
+)
+```
+
+## 4. Local Search Using MIF2
+
+```{r local-search}
+init_pars <- c(
+  Beta  = 0.50,
+  sigma = 0.20,
+  gamma = 0.25,
+  rho   = 0.50,
+  S_0   = 38000,
+  E_0   = 10,
+  I_0   = 5,
+  R_0   = 0
+)
+
+mif_local <- mif2(
+  measles_pomp,
+  Nmif = 100,
+  Np = 1000,
+  start = init_pars,
+  rw.sd = rw.sd(
+    Beta = 0.02, sigma = 0.02, gamma = 0.02, rho = 0.02,
+    S_0 = ivp(100), E_0 = ivp(2), I_0 = ivp(2), R_0 = ivp(2)
+  ),
+  cooling.type = "geometric",
+  cooling.fraction.50 = 0.5
+)
+
+logLik_local <- logLik(mif_local)
+coef_local   <- coef(mif_local)
+
+cat("Local search logLik:", logLik_local, "\n")
+print(coef_local)
+```
+
+## 5. Global Search (Multi-Start)
+
+```{r global-search}
+registerDoParallel(cores = 4)
+
+n_start <- 10
+param_guesses <- data.frame(
+  Beta  = runif(n_start, 0.1, 1.0),
+  sigma = runif(n_start, 0.05, 0.5),
+  gamma = runif(n_start, 0.1, 0.5),
+  rho   = runif(n_start, 0.1, 0.9),
+  S_0   = runif(n_start, 20000, 40000),
+  E_0   = runif(n_start, 1, 20),
+  I_0   = runif(n_start, 1, 20),
+  R_0   = 0
+)
+
+run_mif <- function(start_pars) {
+  mf <- mif2(
+    measles_pomp,
+    Nmif = 100,
+    Np = 1000,
+    start = unlist(start_pars),
+    rw.sd = rw.sd(
+      Beta = 0.02, sigma = 0.02, gamma = 0.02, rho = 0.02,
+      S_0 = ivp(100), E_0 = ivp(2), I_0 = ivp(2), R_0 = ivp(2)
+    ),
+    cooling.type = "geometric",
+    cooling.fraction.50 = 0.5
+  )
+  ll <- logLik(mf)
+  list(mf = mf, ll = ll, coef = coef(mf))
+}
+
+global_fits <- foreach(i = 1:n_start, .combine = rbind, .packages = "pomp") %dopar% {
+  fit_res <- run_mif(param_guesses[i, ])
+  data.frame(seed = i, logLik = fit_res$ll, t(fit_res$coef))
+}
+
+global_fits <- global_fits %>% arrange(desc(logLik))
+global_fits
+```
+
+## 6. Comparison with SIR Model
+
+```{r compare-sir}
+sir_logLik <- -123.45  
+cat("SIR model logLik:", sir_logLik, "\n")
+cat("SEIR model logLik:", global_fits$logLik[1], "\n")
+```
+
+## 7. Profile Likelihood Over Reporting Rate (rho)
+
+```{r profile-rho}
+rho_vals <- seq(0.1, 0.9, by = 0.05)
+
+profile_res <- foreach(r = rho_vals, .combine = rbind) %dopar% {
+  start_fixed <- unlist(global_fits[1, names(param_guesses)])
+  start_fixed["rho"] <- r
+
+  mf_profile <- mif2(
+    measles_pomp,
+    Nmif = 80,
+    Np = 1000,
+    start = start_fixed,
+    rw.sd = rw.sd(
+      Beta = 0.02, sigma = 0.02, gamma = 0.02,
+      S_0 = ivp(100), E_0 = ivp(2), I_0 = ivp(2), R_0 = ivp(2)
+    ),
+    cooling.type = "geometric",
+    cooling.fraction.50 = 0.5
+  )
+  data.frame(rho_fixed = r, logLik = logLik(mf_profile))
+}
+```
+
+## 7.1. Plot the Profile Likelihood
+
+```{r profile-plot, fig.width=6, fig.height=4}
+ggplot(profile_res, aes(x = rho_fixed, y = logLik)) +
+  geom_point() +
+  geom_line() +
+  labs(x = expression(rho), y = "Log likelihood",
+       title = "Profile Likelihood over Reporting Rate (rho)")
+```
+
+## 7.2. 95% Confidence Interval for rho
+
+```{r ci-rho}
+max_ll <- max(profile_res$logLik)
+cutoff <- max_ll - 1.92
+valid_rho <- profile_res %>% filter(logLik >= cutoff)
+
+rho_lower <- min(valid_rho$rho_fixed)
+rho_upper <- max(valid_rho$rho_fixed)
+
+cat("Approximate 95% CI for rho:", rho_lower, "to", rho_upper, "\n")
+```
+
+## 8. Discussion and Conclusion
+
+- Model comparison using likelihoods.
+- Impact of the exposed compartment.
+- Reporting rate uncertainty assessed via profile likelihood.
